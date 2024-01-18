@@ -1,4 +1,3 @@
-import Lean.Data.HashMap
 /-!
 # State
 
@@ -15,6 +14,7 @@ data type containing several important pieces of information. First and foremost
 current player, and it has a random generator.
 -/
 
+import Lean.Data.HashMap
 open Std (HashMap)
 abbrev TileIndex := Nat × Nat -- a 2D index
 
