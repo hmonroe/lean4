@@ -1,4 +1,4 @@
-# Thunks, Tasks, and Threads
+# Thunks
 
 A `Thunk` is defined as
 ```lean
