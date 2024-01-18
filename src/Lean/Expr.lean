@@ -919,6 +919,17 @@ private def getAppNumArgsAux : Expr → Nat → Nat
 def getAppNumArgs (e : Expr) : Nat :=
   getAppNumArgsAux e 0
 
+/--
+Like `Lean.Expr.getAppFn` but assumes the application has up to `maxArgs` arguments.
+If there are any more arguments than this, then they are returned by `getAppFn` as part of the function.
+
+In particular, if the given expression is a sequence of function applications `f a₁ .. aₙ`,
+returns `f a₁ .. aₖ` where `k` is minimal such that `n - k ≤ maxArgs`.
+-/
+def getBoundedAppFn : (maxArgs : Nat) → Expr → Expr
+  | maxArgs' + 1, .app f _ => getBoundedAppFn maxArgs' f
+  | _, e => e
+
 private def getAppArgsAux : Expr → Array Expr → Nat → Array Expr
   | app f a, as, i => getAppArgsAux f (as.set! i a) (i-1)
   | _,       as, _ => as
@@ -928,6 +939,21 @@ private def getAppArgsAux : Expr → Array Expr → Nat → Array Expr
   let dummy := mkSort levelZero
   let nargs := e.getAppNumArgs
   getAppArgsAux e (mkArray nargs dummy) (nargs-1)
+
+private def getBoundedAppArgsAux : Expr → Array Expr → Nat → Array Expr
+  | app f a, as, i + 1 => getBoundedAppArgsAux f (as.set! i a) i
+  | _,       as, _     => as
+
+/--
+Like `Lean.Expr.getAppArgs` but returns up to `maxArgs` arguments.
+
+In particular, given `f a₁ a₂ ... aₙ`, returns `#[aₖ₊₁, ..., aₙ]`
+where `k` is minimal such that the size of this array is at most `maxArgs`.
+-/
+@[inline] def getBoundedAppArgs (maxArgs : Nat) (e : Expr) : Array Expr :=
+  let dummy := mkSort levelZero
+  let nargs := min maxArgs e.getAppNumArgs
+  getBoundedAppArgsAux e (mkArray nargs dummy) nargs
 
 private def getAppRevArgsAux : Expr → Array Expr → Array Expr
   | app f a, as => getAppRevArgsAux f (as.push a)
@@ -946,6 +972,37 @@ private def getAppRevArgsAux : Expr → Array Expr → Array Expr
   let dummy := mkSort levelZero
   let nargs := e.getAppNumArgs
   withAppAux k e (mkArray nargs dummy) (nargs-1)
+
+/--
+Given `f a_1 ... a_n`, returns `#[a_1, ..., a_n]`.
+Note that `f` may be an application.
+The resulting array has size `n` even if `f.getAppNumArgs < n`.
+-/
+@[inline] def getAppArgsN (e : Expr) (n : Nat) : Array Expr :=
+  let dummy := mkSort levelZero
+  loop n e (mkArray n dummy)
+where
+  loop : Nat → Expr → Array Expr → Array Expr
+    | 0,   _,        as => as
+    | i+1, .app f a, as => loop i f (as.set! i a)
+    | _,   _,        _  => panic! "too few arguments at"
+
+/--
+Given `e` of the form `f a_1 ... a_n`, return `f`.
+If `n` is greater than the number of arguments, then return `e.getAppFn`.
+-/
+def stripArgsN (e : Expr) (n : Nat) : Expr :=
+  match n, e with
+  | 0,   _        => e
+  | n+1, .app f _ => stripArgsN f n
+  | _,   _        => e
+
+/--
+Given `e` of the form `f a_1 ... a_n ... a_m`, return `f a_1 ... a_n`.
+If `n` is greater than the arity, then return `e`.
+-/
+def getAppPrefix (e : Expr) (n : Nat) : Expr :=
+  e.stripArgsN (e.getAppNumArgs - n)
 
 /-- Given `e = fn a₁ ... aₙ`, runs `f` on `fn` and each of the arguments `aᵢ` and
 makes a new function application with the results. -/
@@ -1141,10 +1198,9 @@ def hasLooseBVarInExplicitDomain : Expr → Nat → Bool → Bool
 
 /--
 Lower the loose bound variables `>= s` in `e` by `d`.
-That is, a loose bound variable `bvar i`.
-`i >= s` is mapped into `bvar (i-d)`.
+That is, a loose bound variable `bvar i` with `i >= s` is mapped to `bvar (i-d)`.
 
-Remark: if `s < d`, then result is `e`
+Remark: if `s < d`, then the result is `e`.
 -/
 @[extern "lean_expr_lower_loose_bvars"]
 opaque lowerLooseBVars (e : @& Expr) (s d : @& Nat) : Expr
@@ -1653,6 +1709,47 @@ def setAppPPExplicitForExposingMVars (e : Expr) : Expr :=
     mkAppN f args |>.setPPExplicit true
   | _      => e
 
+/--
+Returns true if `e` is a `let_fun` expression, which is an expression of the form `letFun v f`.
+Ideally `f` is a lambda, but we do not require that here.
+Warning: if the `let_fun` is applied to additional arguments (such as in `(let_fun f := id; id) 1`), this function returns `false`.
+-/
+def isLetFun (e : Expr) : Bool := e.isAppOfArity ``letFun 4
+
+/--
+Recognizes a `let_fun` expression.
+For `let_fun n : t := v; b`, returns `some (n, t, v, b)`, which are the first four arguments to `Lean.Expr.letE`.
+Warning: if the `let_fun` is applied to additional arguments (such as in `(let_fun f := id; id) 1`), this function returns `none`.
+
+`let_fun` expressions are encoded as `letFun v (fun (n : t) => b)`.
+They can be created using `Lean.Meta.mkLetFun`.
+
+If in the encoding of `let_fun` the last argument to `letFun` is eta reduced, this returns `Name.anonymous` for the binder name.
+-/
+def letFun? (e : Expr) : Option (Name × Expr × Expr × Expr) :=
+  match e with
+  | .app (.app (.app (.app (.const ``letFun _) t) _β) v) f =>
+    match f with
+    | .lam n _ b _ => some (n, t, v, b)
+    | _ => some (.anonymous, t, v, .app f (.bvar 0))
+  | _ => none
+
+/--
+Like `Lean.Expr.letFun?`, but handles the case when the `let_fun` expression is possibly applied to additional arguments.
+Returns those arguments in addition to the values returned by `letFun?`.
+-/
+def letFunAppArgs? (e : Expr) : Option (Array Expr × Name × Expr × Expr × Expr) := do
+  guard <| 4 ≤ e.getAppNumArgs
+  guard <| e.isAppOf ``letFun
+  let args := e.getAppArgs
+  let t := args[0]!
+  let v := args[2]!
+  let f := args[3]!
+  let rest := args.extract 4 args.size
+  match f with
+  | .lam n _ b _ => some (rest, n, t, v, b)
+  | _ => some (rest, .anonymous, t, v, .app f (.bvar 0))
+
 end Expr
 
 /--
@@ -1669,28 +1766,6 @@ def annotation? (kind : Name) (e : Expr) : Option Expr :=
   match e with
   | .mdata d b => if d.size == 1 && d.getBool kind false then some b else none
   | _          => none
-
-/--
-Annotate `e` with the `let_fun` annotation. This annotation is used as hint for the delaborator.
-If `e` is of the form `(fun x : t => b) v`, then `mkLetFunAnnotation e` is delaborated at
-`let_fun x : t := v; b`
--/
-def mkLetFunAnnotation (e : Expr) : Expr :=
-  mkAnnotation `let_fun e
-
-/--
-Return `some e'` if `e = mkLetFunAnnotation e'`
--/
-def letFunAnnotation? (e : Expr) : Option Expr :=
-  annotation? `let_fun e
-
-/--
-Return true if `e = mkLetFunAnnotation e'`, and `e'` is of the form `(fun x : t => b) v`
--/
-def isLetFun (e : Expr) : Bool :=
-  match letFunAnnotation? e with
-  | none   => false
-  | some e => e.isApp && e.appFn!.isLambda
 
 /--
 Auxiliary annotation used to mark terms marked with the "inaccessible" annotation `.(t)` and
